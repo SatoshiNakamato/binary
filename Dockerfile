@@ -35,7 +35,9 @@ RUN python prepare_connectome.py
 # 0.0.0.0 so the public HTTP/WebSocket service is reachable.
 EXPOSE 3000
 
+# /status is an existing application endpoint and is therefore the health
+# signal used by the container itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT','3000') + '/healthz', timeout=4)" || exit 1
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT','3000') + '/status', timeout=4)" || exit 1
 
 CMD ["python", "run_all.py"]
