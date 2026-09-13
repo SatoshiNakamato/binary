@@ -6,9 +6,12 @@ used. Order submission is hard-coded to the demo group.
 """
 from __future__ import annotations
 import asyncio
+import base64
 import importlib
+import json
 import os
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Optional
@@ -26,11 +29,56 @@ def load_client_class():
         sys.path.insert(0, path)
     return importlib.import_module("olymptrade_ws.core.client").OlympTradeClient
 
+
+def load_access_token(token: Optional[str] = None) -> str:
+    """Load and normalize the raw OlympTrade access_token without logging it."""
+    value = token if token is not None else os.environ.get("OLYMPTRADE_ACCESS_TOKEN", "")
+    value = value.strip()
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    if not value:
+        raise RuntimeError("OLYMPTRADE_ACCESS_TOKEN is required")
+    parts = value.split(".")
+    if len(parts) != 3:
+        raise RuntimeError("OLYMPTRADE_ACCESS_TOKEN is not a 3-part JWT-like token")
+    if not all(parts):
+        raise RuntimeError("OLYMPTRADE_ACCESS_TOKEN contains an empty token segment")
+    return value
+
+
+def token_diagnostics(token: str) -> dict:
+    """Return safe, non-secret diagnostics; never return the token itself."""
+    value = load_access_token(token)
+    result = {
+        "present": True,
+        "segments": 3,
+        "length": len(value),
+        "starts_e": value.startswith("e"),
+        "jwt_payload": "unreadable",
+    }
+    try:
+        payload = value.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        safe = {k: data[k] for k in ("exp", "iat", "nbf", "type") if k in data}
+        result["jwt_payload"] = safe
+        exp = data.get("exp")
+        if isinstance(exp, (int, float)):
+            result["expired"] = time.time() >= exp
+            result["expires_in_seconds"] = int(exp - time.time())
+    except Exception:
+        pass
+    return result
+
+
 @dataclass(frozen=True)
 class Tick:
     pair: str
     price: float
     timestamp: float
+
 
 @dataclass(frozen=True)
 class Candle:
@@ -40,6 +88,7 @@ class Candle:
     high: float
     low: float
     close: float
+
 
 class CandleBuilder:
     def __init__(self, seconds=CANDLE_SECONDS):
@@ -66,12 +115,11 @@ class CandleBuilder:
     def history(self, pair: str, limit=30):
         return list(self.closed.get(pair, []))[-limit:]
 
+
 class OlympTradeDemoGateway:
     def __init__(self, token=None):
-        token = token or os.environ.get("OLYMPTRADE_ACCESS_TOKEN")
-        if not token:
-            raise RuntimeError("OLYMPTRADE_ACCESS_TOKEN is required")
-        self.client = load_client_class()(access_token=token, log_raw_messages=False)
+        normalized = load_access_token(token)
+        self.client = load_client_class()(access_token=normalized, log_raw_messages=False)
         self.candles = CandleBuilder()
         self._candle_callbacks: List[Callable[[Candle], Awaitable[None]]] = []
         self._trade_updates: asyncio.Queue[dict] = asyncio.Queue()
@@ -126,8 +174,20 @@ class OlympTradeDemoGateway:
         self.client.register_callback(1, self._tick)
         for event in (21, 22, 26): self.client.register_callback(event, self._trade)
         self.client.register_callback(183, self._payout_update)
-        await self.client.start()
-        await self.client.initialize_session()
+        try:
+            await self.client.start()
+            await self.client.initialize_session()
+        except Exception as exc:
+            await self.client.stop()
+            message = str(exc)
+            if "invalid_token" in message.lower() or "1008" in message:
+                raise RuntimeError(
+                    "OlympTrade rejected the access token during session initialization "
+                    "(1008 invalid_token). The token is formatted correctly but is not "
+                    "currently accepted by the server; obtain a fresh access_token from "
+                    "the currently logged-in OlympTrade WebSocket session."
+                ) from exc
+            raise
         for _ in range(20):
             data = self.client.current_balance.get("d", []) if isinstance(self.client.current_balance, dict) else []
             for account in data if isinstance(data, list) else []:
